@@ -162,6 +162,7 @@ impl Display for LogLevel {
 ///     - 8.8.8.8
 ///   enhanced-mode: fake-ip
 ///   fake-ip-range: 198.18.0.2/16 # Fake IP addresses pool CIDR
+///   # fake-ip-range6: fdfe:dcba:9876::1/64 # Optional IPv6 pool
 ///   # use-hosts: true # lookup hosts and return IP record
 ///
 ///   # Hostnames in this list will not be resolved with fake IPs
@@ -684,6 +685,8 @@ pub struct DNS {
     /// Fake IP addresses pool CIDR
     #[educe(Default = "198.18.0.1/16")]
     pub fake_ip_range: String,
+    /// Optional IPv6 fake-IP pool CIDR, empty by default.
+    pub fake_ip_range6: String,
     /// Fake IP addresses filter
     pub fake_ip_filter: Vec<String>,
     /// Default nameservers, used to resolve DoH hostnames

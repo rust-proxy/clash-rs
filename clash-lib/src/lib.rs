@@ -444,9 +444,10 @@ async fn create_components(
     let cancellation_token = tokio_util::sync::CancellationToken::new();
 
     debug!("initializing cache store");
-    let cache_store = profile::ThreadSafeCacheFile::new(
+    let cache_store = profile::ThreadSafeCacheFile::with_persistence(
         cwd.join("cache.db").as_path().to_str().unwrap(),
         config.profile.store_selected,
+        config.dns.store_fake_ip,
     );
 
     let system_resolver = Arc::new(
