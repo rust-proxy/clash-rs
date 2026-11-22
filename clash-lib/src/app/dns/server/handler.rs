@@ -2,7 +2,7 @@ use super::DEFAULT_DNS_SERVER_TTL;
 use crate::app::dns::{ThreadSafeDNSResolver, helper::build_dns_response_message};
 use hickory_proto::{
     op::{Message, ResponseCode},
-    rr::{RData, Record, rdata::A},
+    rr::{RData, Record, RecordType, rdata::A},
 };
 use tracing::debug;
 
@@ -11,10 +11,23 @@ pub async fn exchange_with_resolver<'a>(
     req: &'a Message,
     enhanced: bool,
 ) -> Result<Message, watfaq_dns::DNSError> {
-    if req.queries.first().map(|q| q.query_type())
-        == Some(hickory_proto::rr::RecordType::AAAA)
-        || !resolver.fake_ip_enabled()
+    let query = req
+        .queries
+        .first()
+        .ok_or(watfaq_dns::DNSError::InvalidOpQuery(
+            "malformed query message".to_string(),
+        ))?;
+    let fake = enhanced && resolver.fake_ip_enabled();
+    if fake
+        && matches!(
+            query.query_type(),
+            RecordType::AAAA | RecordType::HTTPS | RecordType::SVCB
+        )
+        && let Some(response) = resolver.fake_ip_ipv6_response(req).await
     {
+        return Ok(response);
+    }
+    if !fake || query.query_type() != RecordType::A {
         return match resolver.exchange(req).await {
             Ok(m) => Ok(m),
             Err(e) => {
@@ -24,24 +37,13 @@ pub async fn exchange_with_resolver<'a>(
         };
     }
 
-    let name = req
-        .queries
-        .first()
-        .ok_or(watfaq_dns::DNSError::InvalidOpQuery(
-            "malformed query message".to_string(),
-        ))?
-        .name()
-        .clone();
-
-    let host = req
-        .queries
-        .first()
-        .map(|x| x.name().to_ascii().trim_end_matches('.').to_owned())
-        .unwrap();
+    let name = query.name().clone();
+    let fqdn = name.to_ascii();
+    let host = fqdn.trim_end_matches('.');
 
     let mut res = build_dns_response_message(req, false, false);
 
-    match resolver.resolve_v4(&host, enhanced).await {
+    match resolver.resolve_v4(host, enhanced).await {
         Ok(resp) => match resp {
             Some(ip) => {
                 let rdata = RData::A(A(ip));
@@ -54,10 +56,7 @@ pub async fn exchange_with_resolver<'a>(
 
                 Ok(res)
             }
-            None => {
-                res.metadata.response_code = ResponseCode::NXDomain;
-                Ok(res)
-            }
+            None => Ok(res),
         },
         Err(e) => {
             debug!("dns resolve error: {}", e);

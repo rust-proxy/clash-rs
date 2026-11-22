@@ -624,9 +624,9 @@ impl ClashResolver for EnhancedResolver {
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V4(v4) => *v4,
-                _ => unreachable!("invalid IP family"),
+            return Ok(v.get_data().and_then(|v| match v {
+                net::IpAddr::V4(v4) => Some(*v4),
+                net::IpAddr::V6(_) => None,
             }));
         }
 
@@ -757,6 +757,37 @@ impl ClashResolver for EnhancedResolver {
         self.fake_dns.is_some()
     }
 
+    async fn fake_ip_ipv6_response(
+        &self,
+        request: &op::Message,
+    ) -> Option<op::Message> {
+        let pool = self.fake_dns.as_ref()?;
+        let query = request.queries.first()?;
+        let fqdn = query.name().to_ascii();
+        let host = fqdn.trim_end_matches('.');
+        let mut response = build_dns_response_message(request, true, false);
+        if self.ipv6() {
+            if let Some(ip) =
+                self.hosts.as_ref().and_then(|hosts| hosts.search(host))
+            {
+                if query.query_type() == rr::RecordType::AAAA
+                    && let Some(net::IpAddr::V6(ip)) = ip.get_data()
+                {
+                    response.add_answer(rr::Record::from_rdata(
+                        query.name().clone(),
+                        super::super::server::DEFAULT_DNS_SERVER_TTL,
+                        rr::RData::AAAA(rr::rdata::AAAA(*ip)),
+                    ));
+                }
+            } else if pool.read().await.should_skip(host) {
+                return None;
+            }
+        }
+        // This pool only leases IPv4. A real AAAA would let the client connect
+        // without the domain mapping used by the transparent proxy.
+        Some(response)
+    }
+
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
         if !self.fake_ip_enabled() {
             return false;
@@ -804,6 +835,83 @@ mod tests {
         },
         proxy,
     };
+
+    #[tokio::test]
+    async fn fake_ip_aaaa_uses_the_ipv4_pool_without_querying_upstream() {
+        use crate::{
+            app::dns::{fakeip, server::exchange_with_resolver},
+            common::trie::StringTrie,
+        };
+
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.set_ipv6(true);
+        let mut skipped = StringTrie::new();
+        skipped.insert("+.lan", Arc::new(true));
+        let pool = fakeip::FakeDns::new(fakeip::Opts {
+            ipnet: "198.18.0.0/16".parse().unwrap(),
+            skipped_hostnames: Some(skipped),
+            store: Box::new(fakeip::InMemStore::new(8)),
+        })
+        .unwrap();
+        resolver.fake_dns = Some(Arc::new(tokio::sync::RwLock::new(pool)));
+        let mut hosts = StringTrie::new();
+        hosts.insert("local.test", Arc::new("2001:db8::7".parse().unwrap()));
+        resolver.hosts = Some(hosts);
+        let resolver: crate::app::dns::ThreadSafeDNSResolver = Arc::new(resolver);
+
+        let query = |host: &str, ty| {
+            let mut msg = op::Message::query();
+            msg.add_query(op::Query::query(
+                rr::Name::from_str_relaxed(host).unwrap(),
+                ty,
+            ));
+            msg
+        };
+        for ty in [
+            rr::RecordType::AAAA,
+            rr::RecordType::HTTPS,
+            rr::RecordType::SVCB,
+        ] {
+            let req = query("youtubei.googleapis.com.", ty);
+            let ans = exchange_with_resolver(&resolver, &req, true).await.unwrap();
+            assert_eq!(ans.metadata.id, req.metadata.id);
+            assert_eq!(ans.queries, req.queries);
+            assert_eq!(ans.metadata.response_code, op::ResponseCode::NoError);
+            assert!(ans.answers.is_empty());
+        }
+
+        let ans = exchange_with_resolver(
+            &resolver,
+            &query("youtubei.googleapis.com.", rr::RecordType::A),
+            true,
+        )
+        .await
+        .unwrap();
+        let rr::RData::A(ip) = &ans.answers[0].data else {
+            panic!("expected fake A")
+        };
+        assert_eq!(
+            resolver.reverse_lookup(ip.0.into()).await.as_deref(),
+            Some("youtubei.googleapis.com")
+        );
+        let ans = exchange_with_resolver(
+            &resolver,
+            &query("local.test.", rr::RecordType::AAAA),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ans.answers[0].data,
+            rr::RData::AAAA(rr::rdata::AAAA("2001:db8::7".parse().unwrap()))
+        );
+        assert!(
+            resolver
+                .fake_ip_ipv6_response(&query("router.lan.", rr::RecordType::AAAA))
+                .await
+                .is_none()
+        );
+    }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
     /// IPv6 literal addresses must be returned directly even when dns.ipv6 is

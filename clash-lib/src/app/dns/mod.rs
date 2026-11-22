@@ -113,6 +113,15 @@ pub trait ClashResolver: Sync + Send {
     async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool;
     fn fake_ip_enabled(&self) -> bool;
 
+    /// Reply locally to AAAA or address hints for fake-IP clients, or forward
+    /// upstream.
+    async fn fake_ip_ipv6_response(
+        &self,
+        _request: &op::Message,
+    ) -> Option<op::Message> {
+        None
+    }
+
     fn ipv6(&self) -> bool;
     fn set_ipv6(&self, enable: bool);
 
