@@ -21,7 +21,10 @@ use hickory_proto::{
     },
 };
 use rustls::{ClientConfig, pki_types::ServerName};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{
+    sync::{RwLock, Semaphore},
+    task::JoinHandle,
+};
 use tracing::{info, instrument, trace, warn};
 
 use crate::{
@@ -69,6 +72,7 @@ mod tests {
         let proxy = Arc::new(proxy::direct::Handler::new("test-proxy"));
         let addr = net::SocketAddr::new(net::IpAddr::from([127, 0, 0, 1]), 53);
         DnsClient {
+            stream_slots: None,
             inner: Arc::new(RwLock::new(Inner {
                 c: None,
                 bg_handle: None,
@@ -279,6 +283,9 @@ struct Inner {
 
 /// DnsClient
 pub struct DnsClient {
+    // Hickory's TCP/DoT DnsMultiplexer admits 32 pending questions per
+    // connection. Queue excess queries within the resolver's existing timeout.
+    stream_slots: Option<Semaphore>,
     inner: Arc<RwLock<Inner>>,
 
     cfg: DnsConfig,
@@ -402,6 +409,7 @@ impl DnsClient {
                     opts.fw_mark,
                 );
                 Ok(Arc::new(Self {
+                    stream_slots: None,
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
@@ -424,6 +432,7 @@ impl DnsClient {
                     opts.fw_mark,
                 );
                 Ok(Arc::new(Self {
+                    stream_slots: Some(Semaphore::new(32)),
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
@@ -448,6 +457,7 @@ impl DnsClient {
                     opts.fw_mark,
                 );
                 Ok(Arc::new(Self {
+                    stream_slots: Some(Semaphore::new(32)),
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
@@ -471,6 +481,7 @@ impl DnsClient {
                     opts.fw_mark,
                 );
                 Ok(Arc::new(Self {
+                    stream_slots: None,
                     inner: Arc::new(RwLock::new(Inner {
                         c: None,
                         bg_handle: None,
@@ -564,6 +575,10 @@ impl Client for DnsClient {
 
     #[instrument(skip(msg), level = "trace")]
     async fn exchange(&self, msg: &Message) -> anyhow::Result<Message> {
+        let _permit = match &self.stream_slots {
+            Some(slots) => Some(slots.acquire().await?),
+            None => None,
+        };
         let need_initialize = {
             let inner = self.inner.read().await;
             inner.c.is_none()
