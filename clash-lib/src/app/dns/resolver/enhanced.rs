@@ -24,20 +24,25 @@ use futures::{FutureExt, TryFutureExt};
 use hickory_proto::{op, rr};
 use rand::seq::IndexedRandom;
 use std::{
+    collections::{HashMap, hash_map::Entry},
     net,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, error, instrument, trace, warn};
+
+type LookupResult =
+    Result<Vec<net::IpAddr>, Arc<dyn std::error::Error + Send + Sync>>;
 
 pub struct EnhancedResolver {
     ipv6: AtomicBool,
     hosts: Option<trie::StringTrie<net::IpAddr>>,
     main: Vec<ThreadSafeDNSClient>,
+    pending_lookups: Mutex<HashMap<op::Query, broadcast::Sender<LookupResult>>>,
 
     fallback: Option<Vec<ThreadSafeDNSClient>>,
     fallback_domain_filters: Option<Vec<Box<dyn FallbackDomainFilter>>>,
@@ -67,6 +72,7 @@ impl EnhancedResolver {
         use crate::app::dns::config::NameServer;
 
         EnhancedResolver {
+            pending_lookups: Mutex::default(),
             ipv6: AtomicBool::new(false),
             hosts: None,
             main: make_clients(
@@ -132,6 +138,7 @@ impl EnhancedResolver {
         let edns_client_subnet = cfg.edns_client_subnet.clone();
 
         let default_resolver = Arc::new(EnhancedResolver {
+            pending_lookups: Mutex::default(),
             ipv6: AtomicBool::new(false),
             hosts: None,
             main: make_clients(
@@ -206,6 +213,7 @@ impl EnhancedResolver {
         };
 
         Self {
+            pending_lookups: Mutex::default(),
             ipv6: AtomicBool::new(cfg.ipv6),
             main: make_clients(
                 cfg.nameserver.clone(),
@@ -393,15 +401,35 @@ impl EnhancedResolver {
             .append_domain(&rr::Name::root())?; // makes it FQDN
         q.set_name(name);
         q.set_query_type(record_type);
-        m.add_query(q);
+        // Concurrent connections often need the same A or AAAA record before
+        // the response cache has it. Share only resolver-generated questions:
+        // requests forwarded by the DNS server can carry client-specific EDNS.
+        let sender = loop {
+            let mut receiver =
+                match self.pending_lookups.lock().unwrap().entry(q.clone()) {
+                    Entry::Vacant(entry) => {
+                        break entry.insert(broadcast::channel(1).0).clone();
+                    }
+                    Entry::Occupied(entry) => entry.get().subscribe(),
+                };
+            if let Ok(result) = receiver.recv().await {
+                return Ok(result?);
+            }
+            // The leader was cancelled. Elect one remaining caller to retry.
+        };
+        crate::defer! { self.pending_lookups.lock().unwrap().remove(&q); }
+        m.add_query(q.clone());
         m.metadata.recursion_desired = true;
 
-        let result = self.exchange(&m).await?;
-        let ip_list = EnhancedResolver::ip_list_of_message(&result);
-        if ip_list.is_empty() {
-            return Err(anyhow!("no record for hostname: {}", host));
-        }
-        Ok(ip_list)
+        let result = self.exchange(&m).await.and_then(|reply| {
+            let ips = Self::ip_list_of_message(&reply);
+            anyhow::ensure!(!ips.is_empty(), "no record for hostname: {}", host);
+            Ok(ips)
+        });
+        let result: LookupResult =
+            result.map_err(|e| e.into_boxed_dyn_error().into());
+        let _ = sender.send(result.clone());
+        Ok(result?)
     }
 
     #[instrument(skip_all, level = "trace")]
@@ -878,6 +906,62 @@ mod tests {
             ty,
         ));
         msg
+    }
+
+    #[tokio::test]
+    async fn concurrent_lookup_survives_leader_cancellation_and_shares_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        #[derive(Debug, Default)]
+        struct Upstream {
+            calls: AtomicUsize,
+            release: Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::app::dns::Client for Upstream {
+            fn id(&self) -> String {
+                "test".into()
+            }
+
+            async fn exchange(
+                &self,
+                _: &op::Message,
+            ) -> anyhow::Result<op::Message> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.release.notified().await;
+                anyhow::bail!("upstream unavailable")
+            }
+        }
+
+        let upstream = Arc::new(Upstream::default());
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.main = vec![upstream.clone()];
+        let lookup = || Box::pin(resolver.resolve_v4("example.test", false));
+        let mut first = lookup();
+        let mut second = lookup();
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 1);
+        drop(first);
+        assert!(futures::poll!(&mut second).is_pending());
+        let mut third = lookup();
+        assert!(futures::poll!(&mut third).is_pending());
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 2);
+        upstream.release.notify_one();
+        for result in [second.await, third.await] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("upstream unavailable")
+            );
+        }
+        assert!(resolver.pending_lookups.lock().unwrap().is_empty());
+        upstream.release.notify_one();
+        assert!(lookup().await.is_err());
+        assert_eq!(upstream.calls.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

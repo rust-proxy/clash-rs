@@ -87,6 +87,12 @@ pub trait ClashResolver: Sync + Send {
                 self.resolve_v6(host, enhanced),
                 self.resolve_v4(host, enhanced),
             );
+            // Preserve a failed dual-stack lookup. Returning an empty success
+            // makes DIRECT issue the same two timed-out questions again.
+            let (v6, v4) = match (v6, v4) {
+                (Err(_), Err(err)) => return Err(err),
+                results => results,
+            };
             let mut addrs = Vec::new();
             if let Ok(Some(v6)) = v6 {
                 addrs.push(std::net::IpAddr::V6(v6));
