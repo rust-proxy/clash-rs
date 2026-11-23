@@ -50,6 +50,50 @@ pub struct EdnsClientSubnet {
     pub ipv6: Option<Ipv6Net>,
 }
 
+/// An empty CIDR disables that address family. Keeping the parser on this
+/// type also validates range overrides supplied by native clients.
+#[derive(Clone, Copy, Debug)]
+pub struct FakeIpRange<N>(pub(crate) Option<N>);
+
+impl Default for FakeIpRange<Ipv4Net> {
+    fn default() -> Self {
+        // Retain the native Config default when fake-ip is enabled by a caller.
+        Self(Some(Ipv4Net::default()))
+    }
+}
+
+impl Default for FakeIpRange<Ipv6Net> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<N> std::str::FromStr for FakeIpRange<N>
+where
+    N: std::str::FromStr + Copy + Into<ipnet::IpNet>,
+{
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self, Error> {
+        if value.is_empty() {
+            return Ok(Self(None));
+        }
+        let prefix: N = value.parse().map_err(|_| {
+            Error::InvalidConfig(format!("invalid fake IP prefix: {value}"))
+        })?;
+        let net = prefix.into();
+        // IPv4 keeps its existing .2 start; IPv6 reserves ::0 through ::3
+        // and the last address, matching mihomo.
+        let min_host_bits = if net.network().is_ipv4() { 2 } else { 3 };
+        if net.max_prefix_len() - net.prefix_len() < min_host_bits {
+            return Err(Error::InvalidConfig(format!(
+                "fake IP prefix too small: {value}"
+            )));
+        }
+        Ok(Self(Some(prefix)))
+    }
+}
+
 #[derive(Default)]
 pub struct Config {
     pub enable: bool,
@@ -61,7 +105,8 @@ pub struct Config {
     pub enhance_mode: DNSMode,
     pub default_nameserver: Vec<NameServer>,
     pub proxy_server_nameserver: Option<Vec<NameServer>>,
-    pub fake_ip_range: ipnet::IpNet,
+    pub fake_ip_range: FakeIpRange<Ipv4Net>,
+    pub fake_ip_range6: FakeIpRange<Ipv6Net>,
     pub fake_ip_filter: Vec<String>,
     pub store_fake_ip: bool,
     pub store_smart_stats: bool,
@@ -315,6 +360,24 @@ impl TryFrom<&crate::config::def::Config> for Config {
             )));
         }
 
+        let fake_ip_range: FakeIpRange<Ipv4Net> = dc
+            .fake_ip_range
+            .parse()
+            .map_err(|e| Error::InvalidConfig(format!("dns.fake-ip-range: {e}")))?;
+        let fake_ip_range6: FakeIpRange<Ipv6Net> = dc
+            .fake_ip_range6
+            .parse()
+            .map_err(|e| Error::InvalidConfig(format!("dns.fake-ip-range6: {e}")))?;
+        if matches!(dc.enhanced_mode, crate::config::def::DNSMode::FakeIp)
+            && fake_ip_range.0.is_none()
+            && fake_ip_range6.0.is_none()
+        {
+            return Err(Error::InvalidConfig(
+                "fake-ip mode requires dns.fake-ip-range or dns.fake-ip-range6"
+                    .into(),
+            ));
+        }
+
         let nameservers = Config::parse_nameserver(&dc.nameserver)?;
         let fallback = Config::parse_nameserver(&dc.fallback)?;
         let nameserver_policy =
@@ -451,9 +514,8 @@ impl TryFrom<&crate::config::def::Config> for Config {
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
             proxy_server_nameserver,
-            fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
-                |_| Error::InvalidConfig(String::from("invalid fake ip range")),
-            )?,
+            fake_ip_range,
+            fake_ip_range6,
             fake_ip_filter: dc.fake_ip_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
@@ -566,6 +628,38 @@ mod tests {
             cfg.nameserver[0].interface.as_ref().unwrap().name,
             "explicit"
         );
+    }
+
+    #[test]
+    fn fake_ip_ranges_validate_family_and_capacity() {
+        let parse = |fields: &str| {
+            let yaml = format!("dns:\n  enhanced-mode: fake-ip\n{fields}");
+            let raw: crate::config::def::Config =
+                serde_yaml::from_str(&yaml).unwrap();
+            Config::try_from(raw)
+        };
+        let defaults = parse("").unwrap();
+        assert_eq!(
+            defaults.fake_ip_range.0.unwrap().to_string(),
+            "198.18.0.1/16"
+        );
+        assert!(defaults.fake_ip_range6.0.is_none());
+        assert!(
+            parse("  fake-ip-range6: ''")
+                .unwrap()
+                .fake_ip_range6
+                .0
+                .is_none()
+        );
+        for fields in [
+            "  fake-ip-range: 'fd00::/64'",
+            "  fake-ip-range6: '198.18.0.1/16'",
+            "  fake-ip-range6: 'fd00::/126'",
+            "  fake-ip-range6: 'bad-prefix'",
+            "  fake-ip-range: ''\n  fake-ip-range6: ''",
+        ] {
+            assert!(parse(fields).is_err(), "{fields}");
+        }
     }
 
     #[test]

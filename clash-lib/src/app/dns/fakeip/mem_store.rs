@@ -52,10 +52,6 @@ impl Store for InMemStore {
         Some(ip)
     }
 
-    async fn pub_by_host(&mut self, host: &str, ip: IpAddr) {
-        self.insert_pair(host, ip);
-    }
-
     async fn get_by_ip(&mut self, ip: IpAddr) -> Option<String> {
         let host = self.itoh.get_mut(&ip)?;
         // Cross-check: if htoi doesn't map this host back to the same IP,
@@ -72,12 +68,6 @@ impl Store for InMemStore {
 
     async fn put_by_ip(&mut self, ip: IpAddr, host: &str) {
         self.insert_pair(host, ip);
-    }
-
-    async fn del_by_ip(&mut self, ip: IpAddr) {
-        if let Some(host) = self.itoh.remove(&ip) {
-            self.htoi.remove(&host);
-        }
     }
 
     async fn exist(&mut self, ip: IpAddr) -> bool {

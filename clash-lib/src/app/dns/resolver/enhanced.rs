@@ -9,7 +9,7 @@ use crate::{
     config::def::DNSMode,
     dns::{
         ClashResolver, Config, ResolverKind, RuleDispatch, ThreadSafeDNSClient,
-        fakeip::{self, FileStore, InMemStore, ThreadSafeFakeDns},
+        fakeip::{FakeDns, FileStore, InMemStore, Pool, Store},
         filters::{
             DomainFilter, FallbackDomainFilter, FallbackIPFilter, GeoIPFilter,
             IPNetFilter, PendingMmdb,
@@ -50,7 +50,7 @@ pub struct EnhancedResolver {
     /// Upstream proxy names must bypass fake-IP resolution.
     proxy_server_domains: Option<trie::StringTrie<bool>>,
 
-    fake_dns: Option<ThreadSafeFakeDns>,
+    fake_dns: Option<FakeDns>,
 
     reverse_lookup_cache:
         Option<Arc<RwLock<lru_time_cache::LruCache<net::IpAddr, String>>>>,
@@ -294,26 +294,28 @@ impl EnhancedResolver {
                 None
             },
             fake_dns: match cfg.enhance_mode {
-                DNSMode::FakeIp => Some(Arc::new(RwLock::new(
-                    fakeip::FakeDns::new(fakeip::Opts {
-                        ipnet: cfg.fake_ip_range,
-                        skipped_hostnames: if !cfg.fake_ip_filter.is_empty() {
-                            let mut host = trie::StringTrie::new();
-                            for domain in cfg.fake_ip_filter.iter() {
-                                host.insert(domain.as_str(), Arc::new(true));
-                            }
-                            Some(host)
-                        } else {
-                            None
-                        },
-                        store: if cfg.store_fake_ip {
-                            Box::new(FileStore::new(store))
+                DNSMode::FakeIp => {
+                    let build_pool = |net: ipnet::IpNet| {
+                        let cache: Box<dyn Store> = if cfg.store_fake_ip {
+                            Box::new(FileStore::new(
+                                store.clone(),
+                                net.network().is_ipv6(),
+                            ))
                         } else {
                             Box::new(InMemStore::new(1000))
-                        },
+                        };
+                        RwLock::new(Pool::new(net, cache))
+                    };
+                    let mut skipped = trie::StringTrie::new();
+                    for host in &cfg.fake_ip_filter {
+                        skipped.insert(host, Arc::new(true));
+                    }
+                    Some(FakeDns {
+                        ipv4: cfg.fake_ip_range.0.map(|net| build_pool(net.into())),
+                        ipv6: cfg.fake_ip_range6.0.map(|net| build_pool(net.into())),
+                        skipped_hostnames: skipped,
                     })
-                    .unwrap(),
-                ))),
+                }
                 DNSMode::RedirHost => {
                     warn!(
                         "dns redir-host is not supported and will not do anything"
@@ -489,9 +491,10 @@ impl EnhancedResolver {
         })
     }
 
-    /// Whether a lookup for `host` may allocate a fake IP.
-    fn resolves_with_fake_ip(&self, host: &str) -> bool {
-        self.fake_ip_enabled() && !self.is_proxy_server_domain(host)
+    fn fake_dns_for(&self, host: &str) -> Option<&FakeDns> {
+        self.fake_dns.as_ref().filter(|pool| {
+            !self.is_proxy_server_domain(host) && !pool.should_skip(host)
+        })
     }
 
     fn match_policy(&self, m: &op::Message) -> Option<&Vec<ThreadSafeDNSClient>> {
@@ -638,7 +641,7 @@ impl ClashResolver for EnhancedResolver {
 
                 let futs = vec![fut1.boxed(), fut2.boxed()];
                 let r = futures::future::select_ok(futs).await?;
-                if r.0.is_some() {
+                if r.0.is_some() || r.1.is_empty() {
                     return Ok(r.0);
                 }
                 let r = futures::future::select_all(r.1).await;
@@ -661,9 +664,9 @@ impl ClashResolver for EnhancedResolver {
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V4(v4) => *v4,
-                _ => unreachable!("invalid IP family"),
+            return Ok(v.get_data().and_then(|v| match v {
+                net::IpAddr::V4(v4) => Some(*v4),
+                net::IpAddr::V6(_) => None,
             }));
         }
 
@@ -671,16 +674,8 @@ impl ClashResolver for EnhancedResolver {
             return Ok(Some(ip));
         }
 
-        if enhanced && self.resolves_with_fake_ip(host) {
-            let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-            if !fake_dns.should_skip(host) {
-                let ip = fake_dns.lookup(host).await;
-                debug!("fake dns lookup: {} -> {:?}", host, ip);
-                match ip {
-                    net::IpAddr::V4(v4) => return Ok(Some(v4)),
-                    _ => unreachable!("invalid IP family"),
-                }
-            }
+        if enhanced && let Some(fake) = self.fake_dns_for(host) {
+            return Ok(fake.lookup_v4(host).await);
         }
 
         match self.lookup_ip(host, rr::RecordType::A).await {
@@ -710,10 +705,14 @@ impl ClashResolver for EnhancedResolver {
             && let Some(hosts) = &self.hosts
             && let Some(v) = hosts.search(host)
         {
-            return Ok(v.get_data().map(|v| match v {
-                net::IpAddr::V6(v6) => *v6,
-                _ => unreachable!("invalid IP family"),
+            return Ok(v.get_data().and_then(|ip| match ip {
+                net::IpAddr::V6(ip) => Some(*ip),
+                net::IpAddr::V4(_) => None,
             }));
+        }
+
+        if enhanced && let Some(fake) = self.fake_dns_for(host) {
+            return Ok(fake.lookup_v6(host).await);
         }
 
         match self.lookup_ip(host, rr::RecordType::AAAA).await {
@@ -794,29 +793,59 @@ impl ClashResolver for EnhancedResolver {
         self.fake_dns.is_some()
     }
 
-    async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
-        if !self.fake_ip_enabled() {
-            return false;
+    async fn fake_ip_ipv6_response(
+        &self,
+        request: &op::Message,
+    ) -> Option<op::Message> {
+        let pool = self.fake_dns.as_ref()?;
+        let query = request.queries.first()?;
+        let fqdn = query.name().to_ascii();
+        let host = fqdn.trim_end_matches('.');
+        let mut response = build_dns_response_message(request, true, false);
+        if self.ipv6() {
+            let hosts = self.hosts.as_ref().and_then(|hosts| hosts.search(host));
+            if hosts.is_none() && self.fake_dns_for(host).is_none() {
+                return None;
+            }
+            if query.query_type() == rr::RecordType::AAAA {
+                let ip = match hosts {
+                    Some(record) => record.get_data().and_then(|ip| match ip {
+                        net::IpAddr::V6(ip) => Some(*ip),
+                        net::IpAddr::V4(_) => None,
+                    }),
+                    None => pool.lookup_v6(host).await,
+                };
+                if let Some(ip) = ip {
+                    response.add_answer(rr::Record::from_rdata(
+                        query.name().clone(),
+                        super::super::server::DEFAULT_DNS_SERVER_TTL,
+                        rr::RData::AAAA(rr::rdata::AAAA(ip)),
+                    ));
+                }
+            }
         }
+        Some(response)
+    }
 
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.is_fake_ip(ip).await
+    async fn is_fake_ip(&self, ip: std::net::IpAddr) -> bool {
+        let Some(pool) = self.fake_dns.as_ref().and_then(|fake| fake.pool(ip))
+        else {
+            return false;
+        };
+        pool.write().await.is_fake_ip(ip).await
     }
 
     async fn reverse_lookup(&self, ip: net::IpAddr) -> Option<String> {
         debug!("reverse lookup: {}", ip);
-        if !self.fake_ip_enabled() {
-            return None;
-        }
-
-        let mut fake_dns = self.fake_dns.as_ref().unwrap().write().await;
-        fake_dns.reverse_lookup(ip).await
+        let pool = self.fake_dns.as_ref()?.pool(ip)?;
+        pool.write().await.reverse_lookup(ip).await
     }
 
     async fn flush_fakeip(&self) {
-        if let Some(fake_dns) = &self.fake_dns {
-            let mut fake_dns = fake_dns.write().await;
-            fake_dns.flush().await;
+        if let Some(fake) = &self.fake_dns {
+            for pool in [&fake.ipv4, &fake.ipv6].into_iter().flatten() {
+                pool.write().await.flush().await;
+            }
         }
     }
 }
@@ -841,6 +870,182 @@ mod tests {
         },
         proxy,
     };
+
+    fn query(host: &str, ty: rr::RecordType) -> op::Message {
+        let mut msg = op::Message::query();
+        msg.add_query(op::Query::query(
+            rr::Name::from_str_relaxed(host).unwrap(),
+            ty,
+        ));
+        msg
+    }
+
+    #[tokio::test]
+    async fn fake_ip_aaaa_uses_the_ipv4_pool_without_querying_upstream() {
+        use crate::{
+            app::dns::{fakeip, server::exchange_with_resolver},
+            common::trie::StringTrie,
+        };
+
+        let mut resolver = EnhancedResolver::new_default().await;
+        resolver.set_ipv6(true);
+        let mut skipped = StringTrie::new();
+        skipped.insert("+.lan", Arc::new(true));
+        resolver.fake_dns = Some(fakeip::FakeDns {
+            ipv4: Some(tokio::sync::RwLock::new(fakeip::Pool::new(
+                "198.18.0.0/16".parse().unwrap(),
+                Box::new(fakeip::InMemStore::new(8)),
+            ))),
+            ipv6: None,
+            skipped_hostnames: skipped,
+        });
+        let mut hosts = StringTrie::new();
+        hosts.insert("local.test", Arc::new("2001:db8::7".parse().unwrap()));
+        resolver.hosts = Some(hosts);
+        let resolver: crate::app::dns::ThreadSafeDNSResolver = Arc::new(resolver);
+
+        for ty in [
+            rr::RecordType::AAAA,
+            rr::RecordType::HTTPS,
+            rr::RecordType::SVCB,
+        ] {
+            let req = query("youtubei.googleapis.com.", ty);
+            let ans = exchange_with_resolver(&resolver, &req, true).await.unwrap();
+            assert_eq!(ans.metadata.id, req.metadata.id);
+            assert_eq!(ans.queries, req.queries);
+            assert_eq!(ans.metadata.response_code, op::ResponseCode::NoError);
+            assert!(ans.answers.is_empty());
+        }
+
+        let ans = exchange_with_resolver(
+            &resolver,
+            &query("youtubei.googleapis.com.", rr::RecordType::A),
+            true,
+        )
+        .await
+        .unwrap();
+        let rr::RData::A(ip) = &ans.answers[0].data else {
+            panic!("expected fake A")
+        };
+        assert_eq!(
+            resolver.reverse_lookup(ip.0.into()).await.as_deref(),
+            Some("youtubei.googleapis.com")
+        );
+        let ans = exchange_with_resolver(
+            &resolver,
+            &query("local.test.", rr::RecordType::AAAA),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ans.answers[0].data,
+            rr::RData::AAAA(rr::rdata::AAAA("2001:db8::7".parse().unwrap()))
+        );
+        assert!(
+            resolver
+                .fake_ip_ipv6_response(&query("router.lan.", rr::RecordType::AAAA))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_ip_range6_dns_and_reverse_lookup() {
+        use crate::app::{
+            dns::server::exchange_with_resolver, profile::ThreadSafeCacheFile,
+        };
+        use rr::{RData, RecordType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ThreadSafeCacheFile::new(
+            dir.path().join("cache.yaml").to_str().unwrap(),
+            false,
+        );
+        for ipv4_range in ["198.18.0.1/16", ""] {
+            let yaml = format!(
+                r#"
+ipv6: true
+profile: {{store-fake-ip: true}}
+dns:
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: '{ipv4_range}'
+  fake-ip-range6: 'fdfe:dcba:9876::1/64'
+  fake-ip-filter: ['+.lan']
+"#
+            );
+            let raw: crate::config::def::Config =
+                serde_yaml::from_str(&yaml).unwrap();
+            let resolver: crate::app::dns::ThreadSafeDNSResolver = Arc::new(
+                EnhancedResolver::new(
+                    Config::try_from(raw).unwrap(),
+                    cache.clone(),
+                    None,
+                    Default::default(),
+                    None,
+                )
+                .await,
+            );
+            let host = "video.example";
+            let aaaa = query(host, RecordType::AAAA);
+            let answer = exchange_with_resolver(&resolver, &aaaa, true)
+                .await
+                .unwrap();
+            let RData::AAAA(addr) = answer.answers[0].data else {
+                panic!("expected AAAA");
+            };
+            let ip = std::net::IpAddr::V6(addr.0);
+            assert_eq!(ip.to_string(), "fdfe:dcba:9876::4");
+            assert!(resolver.is_fake_ip(ip).await);
+            assert_eq!(resolver.reverse_lookup(ip).await.as_deref(), Some(host));
+            assert_eq!(resolver.resolve_v6(host, true).await.unwrap(), Some(addr.0));
+
+            let a =
+                exchange_with_resolver(&resolver, &query(host, RecordType::A), true)
+                    .await
+                    .unwrap();
+            if ipv4_range.is_empty() {
+                assert_eq!(a.metadata.response_code, op::ResponseCode::NoError);
+                assert!(a.answers.is_empty());
+            } else {
+                let RData::A(v4) = a.answers[0].data else {
+                    panic!("expected A");
+                };
+                assert_eq!(
+                    resolver.reverse_lookup(v4.0.into()).await.as_deref(),
+                    Some(host)
+                );
+                assert_eq!(resolver.reverse_lookup(ip).await.as_deref(), Some(host));
+            }
+            for ty in [RecordType::HTTPS, RecordType::SVCB] {
+                assert!(
+                    exchange_with_resolver(&resolver, &query(host, ty), true)
+                        .await
+                        .unwrap()
+                        .answers
+                        .is_empty()
+                );
+            }
+            assert!(
+                resolver
+                    .fake_ip_ipv6_response(&query("router.lan", RecordType::AAAA))
+                    .await
+                    .is_none()
+            );
+            resolver.set_ipv6(false);
+            assert!(
+                exchange_with_resolver(&resolver, &aaaa, true)
+                    .await
+                    .unwrap()
+                    .answers
+                    .is_empty()
+            );
+            resolver.flush_fakeip().await;
+            assert!(!resolver.is_fake_ip(ip).await);
+            assert!(resolver.reverse_lookup(ip).await.is_none());
+        }
+    }
 
     /// Regression test for https://github.com/Watfaq/clash-rs/issues/976
     /// IPv6 literal addresses must be returned directly even when dns.ipv6 is
@@ -1413,15 +1618,29 @@ mod tests {
         config.proxy_server_nameserver = None;
         config.enhance_mode = DNSMode::FakeIp;
         config.fake_ip_range = "198.18.0.1/16".parse().unwrap();
+        config.fake_ip_range6 = "fd00::/64".parse().unwrap();
+        config.ipv6 = true;
         let outbounds = make_outbound_registry(&[("proxy", "Proxy.Example.COM.")]);
 
         let resolver =
             EnhancedResolver::new(config, cache_store, None, outbounds, None).await;
 
         assert!(resolver.fake_ip_enabled());
-        assert!(!resolver.resolves_with_fake_ip("proxy.example.com"));
-        assert!(!resolver.resolves_with_fake_ip("PROXY.example.com."));
-        assert!(resolver.resolves_with_fake_ip("target.example.com"));
+        assert!(resolver.fake_dns_for("proxy.example.com").is_none());
+        assert!(resolver.fake_dns_for("PROXY.example.com.").is_none());
+        assert!(resolver.fake_dns_for("target.example.com").is_some());
+        for ty in [
+            rr::RecordType::AAAA,
+            rr::RecordType::HTTPS,
+            rr::RecordType::SVCB,
+        ] {
+            assert!(
+                resolver
+                    .fake_ip_ipv6_response(&query("PROXY.example.com.", ty))
+                    .await
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]
